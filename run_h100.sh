@@ -34,7 +34,8 @@ export ATTN_SDP_BACKEND="flash"
 # TRAIN_BATCH_TOKENS=786432 (default, correct for 8×H100)
 # TRAIN_SEQ_LEN=2048 (default)
 export ITERATIONS="20000"
-export MAX_WALLCLOCK_SECONDS="600"
+# Small safety buffer below the hard 600s challenge cap.
+export MAX_WALLCLOCK_SECONDS="599.5"
 export WARMUP_STEPS="0"
 export WARMDOWN_ITERS="4000"
 export USE_TORCH_COMPILE="1"
