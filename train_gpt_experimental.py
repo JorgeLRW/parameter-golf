@@ -2237,7 +2237,17 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
-        dist.init_process_group(backend="nccl", device_id=device)
+        try:
+            dist.init_process_group(backend="nccl", device_id=local_rank)
+        except Exception as exc:
+            print(
+                f"dist_init: device_id-based NCCL init failed on local_rank={local_rank} "
+                f"with {type(exc).__name__}: {exc}; retrying without device_id",
+                flush=True,
+            )
+            if dist.is_initialized():
+                dist.destroy_process_group()
+            dist.init_process_group(backend="nccl")
         dist.barrier()
     master_process = rank == 0
     torch.backends.cuda.matmul.allow_tf32 = True
