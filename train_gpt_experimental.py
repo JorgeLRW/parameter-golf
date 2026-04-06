@@ -102,6 +102,27 @@ class Hyperparameters:
     mlp_act = os.environ.get("MLP_ACT", "leakyrelu2").strip().lower()
     mlp_competitive_frac = float(os.environ.get("MLP_COMPETITIVE_FRAC", 1.0))
     serial_fusion = bool(int(os.environ.get("SERIAL_FUSION", "0")))
+    post_norm_affine = bool(int(os.environ.get("POST_NORM_AFFINE", "0")))
+    mlp_resid_gate = bool(int(os.environ.get("MLP_RESID_GATE", "0")))
+    mlp_modulate_next = bool(int(os.environ.get("MLP_MODULATE_NEXT", "0")))
+    geometric_routing_rank = int(os.environ.get("GEOMETRIC_ROUTING_RANK", "0"))
+    mrg_gate_slope = float(os.environ.get("MRG_GATE_SLOPE", "0.0"))  # per-layer init slope: layer0 gets -slope_low
+    mrg_gate_slope_high = float(os.environ.get("MRG_GATE_SLOPE_HIGH", "0.0"))  # last layer gets +slope_high
+    mrg_gate_mode = os.environ.get("MRG_GATE_MODE", "attn").strip().lower()  # attn: gate*x_attn+mlp, mlp: x_attn+gate*mlp, interp: gate*x_attn+(1-gate)*mlp
+    mrg_scalar_gate = bool(int(os.environ.get("MRG_SCALAR_GATE", "0")))  # 1=single scalar per layer, 0=per-dim
+    mrg_ceiling_schedule = os.environ.get("MRG_CEILING_SCHEDULE", "linear").strip().lower()  # linear or step
+    aux_loss_weight = float(os.environ.get("AUX_LOSS_WEIGHT", "0.0"))  # per-layer auxiliary prediction loss weight (0=off)
+    skip_attn_layers = os.environ.get("SKIP_ATTN_LAYERS", "").strip()  # comma-sep layer indices to skip attention (e.g. "9,10")
+    route_attn_layers = os.environ.get("ROUTE_ATTN_LAYERS", "").strip()  # comma-sep layer indices: replace attention with Q->act->O channel mixer
+    route_into_mlp = bool(int(os.environ.get("ROUTE_INTO_MLP", "0")))  # 1=route output feeds into MLP (pre-conditioner), 0=route adds to residual then MLP
+    route_dim = int(os.environ.get("ROUTE_DIM", "0"))  # 0=use model_dim (share qo_bank), >0=separate route banks with this hidden dim
+    route_shared = bool(int(os.environ.get("ROUTE_SHARED", "0")))  # 1=shared up/down projections across all route layers, per-layer mix matrix in bottleneck
+    token_shift_frac = float(os.environ.get("TOKEN_SHIFT_FRAC", "0.0"))  # fraction of channels to shift back by 1 position in route layers (0=off, 0.25=25%)
+    token_shift_scales = tuple(int(x) for x in os.environ.get("TOKEN_SHIFT_SCALES", "1").split(","))  # shift offsets, e.g. "1" or "1,2" or "1,2,4"
+    time_mix = bool(int(os.environ.get("TIME_MIX", "0")))  # 1=learned per-channel time mixing in route layers (RWKV-style)
+    init_mlp_up_gain = float(os.environ.get("INIT_MLP_UP_GAIN", "1.0"))  # gain for mlp_up orthogonal init (converged model ~1.3)
+    init_mlp_down_gain = float(os.environ.get("INIT_MLP_DOWN_GAIN", "1.0"))  # gain for mlp_down zero-then-scale init (converged ~0.62 vs default proj_scale)
+    init_o_proj_gain = float(os.environ.get("INIT_O_PROJ_GAIN", "1.0"))  # gain multiplier for O proj zero-then-scale init (-1.0 = negative / pessimistic)
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
@@ -842,6 +863,7 @@ class MLP(nn.Module):
             hidden = F.gelu(hidden, approximate="tanh")
         else:
             hidden = F.leaky_relu(hidden, negative_slope=0.5).square()
+            hidden = apply_competitive_selection(hidden, self.competitive_frac)
         return F.linear(hidden, down_w.to(x.dtype))
 
 class Block(nn.Module):
@@ -861,8 +883,27 @@ class Block(nn.Module):
         mlp_act: str = "leakyrelu2",
         mlp_competitive_frac: float = 1.0,
         serial_fusion: bool = False,
+        post_norm_affine: bool = False,
+        mlp_resid_gate: bool = False,
+        mlp_modulate_next: bool = False,
+        geometric_routing_rank: int = 0,
+        mrg_gate_init: float = 0.0,
+        mrg_gate_mode: str = "attn",
+        mrg_scalar_gate: bool = False,
+        skip_attention: bool = False,
+        route_attention: bool = False,
+        route_into_mlp: bool = False,
+        time_mix: bool = False,
     ):
         super().__init__()
+        self.skip_attention = skip_attention
+        self.route_attention = route_attention
+        self.route_into_mlp = route_into_mlp
+        # Per-layer learned time mixing for route layers (RWKV-style)
+        if route_attention and time_mix:
+            self.time_mix_mu = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        else:
+            self.time_mix_mu = None
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(
@@ -880,6 +921,38 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
         self.serial_fusion = serial_fusion
+        # Post-freeze optimization options
+        if post_norm_affine:
+            self.pna_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.pna_bias = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        else:
+            self.pna_scale = None
+            self.pna_bias = None
+        if geometric_routing_rank > 0:
+            self.geo_gate_down = nn.Linear(dim, geometric_routing_rank, bias=False)
+            self.geo_gate_up = nn.Linear(geometric_routing_rank, dim, bias=True)
+            nn.init.zeros_(self.geo_gate_up.weight)  # dynamic part starts at 0
+            nn.init.zeros_(self.geo_gate_up.bias)     # sigmoid(0)=0.5, same as static MRG
+            self.mrg_gate = None  # superseded by geometric routing
+        elif mlp_resid_gate:
+            self.geo_gate_down = None
+            self.geo_gate_up = None
+            # Product gate: ceiling (fixed, non-learnable) * openness (learned)
+            # ceiling bounds how much frozen attention can pass through per layer
+            gate_size = 1 if mrg_scalar_gate else dim
+            self.register_buffer('mrg_ceiling', torch.sigmoid(torch.tensor(mrg_gate_init)).expand(gate_size).clone())
+            self.mrg_gate = nn.Parameter(torch.zeros(gate_size, dtype=torch.float32))  # openness, sigmoid(0)=0.5
+            self.mrg_gate_mode = mrg_gate_mode
+        else:
+            self.geo_gate_down = None
+            self.geo_gate_up = None
+            self.mrg_gate = None
+        self.mlp_modulate_next = mlp_modulate_next
+        if mlp_modulate_next:
+            self.mod_proj = nn.Linear(dim, dim, bias=False)
+            nn.init.zeros_(self.mod_proj.weight)  # init as identity (no modulation)
+        else:
+            self.mod_proj = None
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
             nn.init.zeros_(self.dtg_gate.weight)
@@ -900,10 +973,114 @@ class Block(nn.Module):
         v_embed: Tensor | None = None,
         v0: Tensor | None = None,
         detach_attn_input: bool = False,
-    ) -> tuple[Tensor, Tensor | None]:
+        modulation: Tensor | None = None,
+        route_mix_w: Tensor | None = None,
+        token_shift_splits: tuple = (),
+    ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        if self.skip_attention:
+            # Skip attention entirely — just run MLP on the residual
+            mlp_signal = self.mlp_norm(x_in) * self.ln_scale_factor
+            mlp_out = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * self.mlp(
+                mlp_signal, up_w, down_w, gate_w)
+            x_out = x_in + mlp_out
+            next_mod = None
+            if self.mod_proj is not None:
+                next_mod = self.mod_proj(mlp_out.detach())
+            return x_out, None, next_mod
+        if self.route_attention:
+            # Token shifting: mix in previous position's hidden state for spatial coherence
+            # Temporal mixing: learned per-channel blend with previous position
+            if self.time_mix_mu is not None:
+                mu = torch.sigmoid(self.time_mix_mu.to(dtype=x_in.dtype)).view(1, 1, -1)
+                x_prev = F.pad(x_in[:, :-1], (0, 0, 1, 0))
+                x_in = mu * x_in + (1.0 - mu) * x_prev
+            elif len(token_shift_splits) == 1:
+                # Single-scale shift: fast path
+                shift_by, n = token_shift_splits[0]
+                shifted = F.pad(x_in[:, :-shift_by, :n], (0, 0, shift_by, 0))
+                x_in = torch.cat([shifted, x_in[:, :, n:]], dim=-1)
+            elif len(token_shift_splits) > 1:
+                # Multi-scale shift: different channel groups shifted by different offsets
+                parts = []
+                ch_offset = 0
+                for shift_by, n_channels in token_shift_splits:
+                    chunk = x_in[:, :, ch_offset:ch_offset + n_channels]
+                    parts.append(F.pad(chunk[:, :-shift_by], (0, 0, shift_by, 0)))
+                    ch_offset += n_channels
+                parts.append(x_in[:, :, ch_offset:])  # remaining unshifted channels
+                x_in = torch.cat(parts, dim=-1)
+            # Channel mixer: Q -> leaky_relu^2 -> O (replaces attention)
+            route_signal = self.attn_norm(x_in) * self.ln_scale_factor
+            if modulation is not None:
+                route_signal = route_signal * (1.0 + modulation)
+            route_hidden = F.linear(route_signal, q_w.to(route_signal.dtype))
+            route_hidden = F.leaky_relu(route_hidden, negative_slope=0.5).square()
+            if route_mix_w is not None:
+                route_hidden = F.linear(route_hidden, route_mix_w.to(route_hidden.dtype))
+            route_out = F.linear(route_hidden, out_w.to(route_signal.dtype))
+            route_scaled = self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * route_out
+            if self.route_into_mlp:
+                # Route as MLP pre-conditioner: route doesn't add to residual,
+                # it reshapes features before the MLP acts on them.
+                # x_out = x_in + mlp(norm(x_in + route(x_in)))
+                mlp_signal = self.mlp_norm(x_in + route_scaled) * self.ln_scale_factor
+                mlp_out = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * self.mlp(
+                    mlp_signal, up_w, down_w, gate_w)
+                x_out = x_in + mlp_out
+                next_mod = None
+                if self.mod_proj is not None:
+                    next_mod = self.mod_proj(mlp_out.detach())
+                return x_out, None, next_mod
+            if self.mrg_gate is not None and self.mrg_gate_mode == "route":
+                # "route" mode: gate controls route expressiveness only,
+                # residual flows through ungated. MLP sees gated route.
+                # x_out = x_in + gate * route + mlp(norm(x_in + gate * route))
+                ceiling = self.mrg_ceiling.to(dtype=x_in.dtype).view(1, 1, -1)
+                openness = torch.sigmoid(self.mrg_gate.to(dtype=x_in.dtype)).view(1, 1, -1)
+                gate = ceiling * openness
+                x_attn = x_in + gate * route_scaled
+                mlp_signal = self.mlp_norm(x_attn) * self.ln_scale_factor
+                mlp_out = self.mlp_scale.to(dtype=x_attn.dtype)[None, None, :] * self.mlp(
+                    mlp_signal, up_w, down_w, gate_w)
+                x_out = x_attn + mlp_out
+                next_mod = None
+                if self.mod_proj is not None:
+                    next_mod = self.mod_proj(mlp_out.detach())
+                return x_out, None, next_mod
+            x_attn = x_in + route_scaled
+            mlp_signal = self.mlp_norm(x_attn) * self.ln_scale_factor
+            mlp_out = self.mlp_scale.to(dtype=x_attn.dtype)[None, None, :] * self.mlp(
+                mlp_signal, up_w, down_w, gate_w)
+            if self.geo_gate_down is not None:
+                route_signal_for_gate = self.attn_norm(x_in) * self.ln_scale_factor
+                gate = torch.sigmoid(self.geo_gate_up(self.geo_gate_down(route_signal_for_gate)))
+                x_out = gate * x_attn + mlp_out
+            elif self.mrg_gate is not None:
+                ceiling = self.mrg_ceiling.to(dtype=x_attn.dtype).view(1, 1, -1)
+                openness = torch.sigmoid(self.mrg_gate.to(dtype=x_attn.dtype)).view(1, 1, -1)
+                gate = ceiling * openness
+                mode = self.mrg_gate_mode
+                if mode == "mlp":
+                    x_out = x_attn + gate * mlp_out
+                elif mode == "interp":
+                    x_out = gate * x_attn + (1.0 - gate) * mlp_out
+                else:
+                    x_out = gate * x_attn + mlp_out
+            else:
+                x_out = x_attn + mlp_out
+            next_mod = None
+            if self.mod_proj is not None:
+                next_mod = self.mod_proj(mlp_out.detach())
+            return x_out, None, next_mod
         attn_signal = self.attn_norm(x_in) * self.ln_scale_factor
+        # Apply incoming modulation from previous layer's MLP
+        if modulation is not None:
+            attn_signal = attn_signal * (1.0 + modulation)
+        # Apply post-norm affine transform
+        if self.pna_scale is not None:
+            attn_signal = self.pna_scale.to(dtype=attn_signal.dtype)[None, None, :] * attn_signal + self.pna_bias.to(dtype=attn_signal.dtype)[None, None, :]
         attn_input = attn_signal.detach() if detach_attn_input else attn_signal
         attn_out, raw_v = self.attn(attn_input, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         attn_scaled = self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
@@ -920,11 +1097,31 @@ class Block(nn.Module):
             down_w,
             gate_w,
         )
-        x_out = x_attn + mlp_out
+        # MLP residual gating: sigmoid(gate) * residual + mlp_out
+        if self.geo_gate_down is not None:
+            gate = torch.sigmoid(self.geo_gate_up(self.geo_gate_down(attn_signal)))
+            x_out = gate * x_attn + mlp_out
+        elif self.mrg_gate is not None:
+            ceiling = self.mrg_ceiling.to(dtype=x_attn.dtype).view(1, 1, -1)
+            openness = torch.sigmoid(self.mrg_gate.to(dtype=x_attn.dtype)).view(1, 1, -1)
+            gate = ceiling * openness
+            mode = self.mrg_gate_mode
+            if mode == "mlp":
+                x_out = x_attn + gate * mlp_out
+            elif mode == "interp":
+                x_out = gate * x_attn + (1.0 - gate) * mlp_out
+            else:  # "attn" (default)
+                x_out = gate * x_attn + mlp_out
+        else:
+            x_out = x_attn + mlp_out
         if self.dtg_gate is not None:
-            gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
-            x_out = x_in + gate * (x_out - x_in)
-        return x_out, raw_v
+            gate_dtg = torch.sigmoid(self.dtg_gate(x_in.detach()))
+            x_out = x_in + gate_dtg * (x_out - x_in)
+        # Produce modulation for next layer
+        next_mod = None
+        if self.mod_proj is not None:
+            next_mod = self.mod_proj(mlp_out.detach())  # detach: modulation is a signal, not a gradient path
+        return x_out, raw_v, next_mod
 
 class GPT(nn.Module):
     def __init__(
@@ -957,6 +1154,27 @@ class GPT(nn.Module):
         mlp_act: str = "leakyrelu2",
         mlp_competitive_frac: float = 1.0,
         serial_fusion: bool = False,
+        post_norm_affine: bool = False,
+        mlp_resid_gate: bool = False,
+        mlp_modulate_next: bool = False,
+        geometric_routing_rank: int = 0,
+        mrg_gate_slope: float = 0.0,
+        mrg_gate_slope_high: float = 0.0,
+        mrg_gate_mode: str = "attn",
+        mrg_scalar_gate: bool = False,
+        mrg_ceiling_schedule: str = "linear",
+        aux_loss_weight: float = 0.0,
+        skip_attn_layers: str = "",
+        route_attn_layers: str = "",
+        route_into_mlp: bool = False,
+        route_dim: int = 0,
+        route_shared: bool = False,
+        token_shift_frac: float = 0.0,
+        token_shift_scales: tuple[int, ...] = (1,),
+        time_mix: bool = False,
+        init_mlp_up_gain: float = 1.0,
+        init_mlp_down_gain: float = 1.0,
+        init_o_proj_gain: float = 1.0,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -971,6 +1189,37 @@ class GPT(nn.Module):
         self.mlp_act = mlp_act
         self.mlp_competitive_frac = mlp_competitive_frac
         self.serial_fusion = serial_fusion
+        self.post_norm_affine = post_norm_affine
+        self.mlp_resid_gate = mlp_resid_gate
+        self.mlp_modulate_next = mlp_modulate_next
+        self.geometric_routing_rank = geometric_routing_rank
+        self.mrg_gate_slope = mrg_gate_slope
+        self.mrg_gate_slope_high = mrg_gate_slope_high
+        self.mrg_gate_mode = mrg_gate_mode
+        self.mrg_scalar_gate = mrg_scalar_gate
+        self.mrg_ceiling_schedule = mrg_ceiling_schedule
+        self.aux_loss_weight = aux_loss_weight
+        self._skip_attn_set = set(int(x) for x in skip_attn_layers.split(",") if x.strip())
+        self._route_attn_set = set(int(x) for x in route_attn_layers.split(",") if x.strip())
+        self._route_into_mlp = route_into_mlp
+        self._route_dim = route_dim
+        self._route_shared = route_shared
+        # Precompute token shift splits: tuple of (shift_amount, n_channels)
+        if token_shift_frac > 0:
+            total_shift = int(model_dim * token_shift_frac)
+            n_scales = len(token_shift_scales)
+            per_scale = total_shift // n_scales
+            splits = [(s, per_scale) for s in token_shift_scales]
+            remainder = total_shift - per_scale * n_scales
+            if remainder > 0:
+                splits[0] = (splits[0][0], splits[0][1] + remainder)
+            self._token_shift_splits = tuple(splits)
+        else:
+            self._token_shift_splits = ()
+        self._time_mix = time_mix
+        self._init_mlp_up_gain = init_mlp_up_gain
+        self._init_mlp_down_gain = init_mlp_down_gain
+        self._init_o_proj_gain = init_o_proj_gain
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
@@ -990,6 +1239,38 @@ class GPT(nn.Module):
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
         self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
         self.mlp_gate_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim)) if mlp_uses_gated_branch(mlp_act) else None
+        # Separate route banks when route_dim > 0 (purpose-built channel mixer weights)
+        num_route_layers = len(self._route_attn_set)
+        self._route_layer_indices = sorted(self._route_attn_set)
+        if route_dim > 0 and num_route_layers > 0 and route_shared:
+            # Shared up/down projections + per-layer mixing in bottleneck
+            self.route_shared_up = nn.Parameter(torch.empty(route_dim, model_dim))    # one shared projection in
+            self.route_shared_down = nn.Parameter(torch.empty(model_dim, route_dim))  # one shared projection out
+            self.route_mix_bank = nn.Parameter(torch.empty(num_route_layers, route_dim, route_dim))  # per-layer mix
+            self.route_up_bank = None
+            self.route_down_bank = None
+        elif route_dim > 0 and num_route_layers > 0:
+            # Independent per-layer route banks
+            self.route_shared_up = None
+            self.route_shared_down = None
+            self.route_mix_bank = None
+            self.route_up_bank = nn.Parameter(torch.empty(num_route_layers, route_dim, model_dim))
+            self.route_down_bank = nn.Parameter(torch.empty(num_route_layers, model_dim, route_dim))
+        else:
+            self.route_shared_up = None
+            self.route_shared_down = None
+            self.route_mix_bank = None
+            self.route_up_bank = None
+            self.route_down_bank = None
+        self._route_idx_map = {li: ri for ri, li in enumerate(self._route_layer_indices)}
+
+        def _ceiling_init(i):
+            frac = i / max(num_layers - 1, 1)
+            if mrg_ceiling_schedule == "step":
+                return -mrg_gate_slope if frac < 0.5 else mrg_gate_slope_high
+            else:  # "linear"
+                return -mrg_gate_slope + (mrg_gate_slope + mrg_gate_slope_high) * frac
+
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -1007,6 +1288,17 @@ class GPT(nn.Module):
                     mlp_act=mlp_act,
                     mlp_competitive_frac=mlp_competitive_frac,
                     serial_fusion=serial_fusion,
+                    post_norm_affine=post_norm_affine,
+                    mlp_resid_gate=mlp_resid_gate,
+                    mlp_modulate_next=mlp_modulate_next,
+                    geometric_routing_rank=geometric_routing_rank,
+                    mrg_gate_init=_ceiling_init(i),
+                    mrg_gate_mode=mrg_gate_mode,
+                    mrg_scalar_gate=mrg_scalar_gate,
+                    skip_attention=(i in self._skip_attn_set),
+                    route_attention=(i in self._route_attn_set),
+                    route_into_mlp=self._route_into_mlp,
+                    time_mix=self._time_mix,
                 )
                 for i in range(num_layers)
             ]
@@ -1058,13 +1350,26 @@ class GPT(nn.Module):
             nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
             nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
             nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
-            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
+            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=self._init_mlp_up_gain)    # MLP up
             if self.mlp_gate_bank is not None:
-                nn.init.orthogonal_(self.mlp_gate_bank.data[i], gain=1.0)
+                nn.init.orthogonal_(self.mlp_gate_bank.data[i], gain=self._init_mlp_up_gain)
             nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
-            self.qo_bank.data[n + i].mul_(proj_scale)
-            self.mlp_down_bank.data[i].mul_(proj_scale)
+            self.qo_bank.data[n + i].mul_(proj_scale * self._init_o_proj_gain)
+            self.mlp_down_bank.data[i].mul_(proj_scale * self._init_mlp_down_gain)
+        # Init route banks (if separate from qo_bank)
+        if self.route_up_bank is not None:
+            for ri in range(self.route_up_bank.shape[0]):
+                nn.init.orthogonal_(self.route_up_bank.data[ri], gain=1.0)
+                nn.init.zeros_(self.route_down_bank.data[ri])
+                self.route_down_bank.data[ri].mul_(proj_scale * self._init_o_proj_gain)
+        # Init shared route projections + per-layer mix
+        if self.route_shared_up is not None:
+            nn.init.orthogonal_(self.route_shared_up.data, gain=1.0)
+            nn.init.zeros_(self.route_shared_down.data)
+            self.route_shared_down.data.mul_(proj_scale * self._init_o_proj_gain)
+            for ri in range(self.route_mix_bank.shape[0]):
+                nn.init.eye_(self.route_mix_bank.data[ri])  # start as identity
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
@@ -1072,6 +1377,16 @@ class GPT(nn.Module):
                     nn.init.zeros_(module.weight)
                 elif module.weight.ndim == 2 and module.weight.shape[0] >= 64 and module.weight.shape[1] >= 64:
                     nn.init.orthogonal_(module.weight, gain=1.0)
+    def _get_qo(self, layer_idx: int):
+        """Return (q_w, out_w, mix_w) for a layer. mix_w is non-None only in shared route mode."""
+        if self.route_shared_up is not None and layer_idx in self._route_idx_map:
+            ri = self._route_idx_map[layer_idx]
+            return self.route_shared_up, self.route_shared_down, self.route_mix_bank[ri]
+        if self.route_up_bank is not None and layer_idx in self._route_idx_map:
+            ri = self._route_idx_map[layer_idx]
+            return self.route_up_bank[ri], self.route_down_bank[ri], None
+        return self.qo_bank[layer_idx], self.qo_bank[self.num_layers + layer_idx], None
+
     def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
         """Get value embedding for a specific layer using shared table + per-layer scale."""
         if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
@@ -1093,28 +1408,43 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         detach_attn_input = self._should_detach_attn_input()
+        next_mod = None
+        collect_aux = self.training and self.aux_loss_weight > 0
+        aux_hiddens: list[Tensor] = []
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+            q_w, out_w, mix_w = self._get_qo(i)
+            x, raw_v, next_mod = self.blocks[i](x, x0,
+                q_w, self.kv_bank[i], self.kv_bank[n + i],
+                out_w, self.mlp_up_bank[i], self.mlp_down_bank[i],
                 self.mlp_gate_bank[i] if self.mlp_gate_bank is not None else None,
                 v_embed=ve, v0=v0,
-                detach_attn_input=detach_attn_input)
+                detach_attn_input=detach_attn_input,
+                modulation=next_mod,
+                route_mix_w=mix_w,
+                token_shift_splits=self._token_shift_splits)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
+            if collect_aux:
+                aux_hiddens.append(x)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+            q_w, out_w, mix_w = self._get_qo(bi)
+            x, _, next_mod = self.blocks[bi](x, x0,
+                q_w, self.kv_bank[bi], self.kv_bank[n + bi],
+                out_w, self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 self.mlp_gate_bank[bi] if self.mlp_gate_bank is not None else None,
                 v_embed=ve, v0=v0,
-                detach_attn_input=detach_attn_input)
+                detach_attn_input=detach_attn_input,
+                modulation=next_mod,
+                route_mix_w=mix_w,
+                token_shift_splits=self._token_shift_splits)
+            if collect_aux:
+                aux_hiddens.append(x)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1126,6 +1456,17 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         main_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        if collect_aux and len(aux_hiddens) > 0:
+            dim = x.size(-1)
+            emb_w = self.tok_emb.weight
+            aux_loss_sum = x.new_zeros(())
+            for h in aux_hiddens:
+                h_norm = F.rms_norm(h, (dim,))
+                h_flat = h_norm.reshape(-1, dim)
+                aux_logits_proj = F.linear(h_flat, emb_w)
+                aux_logits = self.logit_softcap * torch.tanh(aux_logits_proj / self.logit_softcap)
+                aux_loss_sum = aux_loss_sum + F.cross_entropy(aux_logits.float(), targets, reduction="mean")
+            main_loss = main_loss + self.aux_loss_weight * (aux_loss_sum / len(aux_hiddens))
         if self.training and self.mtp_num_heads > 0 and self.mtp_loss_weight > 0.0:
             _, seqlen, dim = x.shape
             mtp_loss_sum = x.new_zeros(())
@@ -1157,14 +1498,19 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         detach_attn_input = self._should_detach_attn_input()
+        next_mod = None
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+            q_w, out_w, mix_w = self._get_qo(i)
+            x, raw_v, next_mod = self.blocks[i](x, x0,
+                q_w, self.kv_bank[i], self.kv_bank[n + i],
+                out_w, self.mlp_up_bank[i], self.mlp_down_bank[i],
                 self.mlp_gate_bank[i] if self.mlp_gate_bank is not None else None,
                 v_embed=ve, v0=v0,
-                detach_attn_input=detach_attn_input)
+                detach_attn_input=detach_attn_input,
+                modulation=next_mod,
+                route_mix_w=mix_w,
+                token_shift_splits=self._token_shift_splits)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -1173,12 +1519,16 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+            q_w, out_w, mix_w = self._get_qo(bi)
+            x, _, next_mod = self.blocks[bi](x, x0,
+                q_w, self.kv_bank[bi], self.kv_bank[n + bi],
+                out_w, self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 self.mlp_gate_bank[bi] if self.mlp_gate_bank is not None else None,
                 v_embed=ve, v0=v0,
-                detach_attn_input=detach_attn_input)
+                detach_attn_input=detach_attn_input,
+                modulation=next_mod,
+                route_mix_w=mix_w,
+                token_shift_splits=self._token_shift_splits)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1623,6 +1973,7 @@ class _HessianMLP(nn.Module):
             hidden = F.gelu(hidden, approximate="tanh")
         else:
             hidden = F.leaky_relu(hidden, negative_slope=0.5).square()
+            hidden = apply_competitive_selection(hidden, self.mlp_competitive_frac)
         return self.proj(hidden)
 
 class _HessianBlock(nn.Module):
@@ -1980,6 +2331,27 @@ def main() -> None:
         mlp_act=args.mlp_act,
         mlp_competitive_frac=args.mlp_competitive_frac,
         serial_fusion=args.serial_fusion,
+        post_norm_affine=args.post_norm_affine,
+        mlp_resid_gate=args.mlp_resid_gate,
+        mlp_modulate_next=args.mlp_modulate_next,
+        geometric_routing_rank=args.geometric_routing_rank,
+        mrg_gate_slope=args.mrg_gate_slope,
+        mrg_gate_slope_high=args.mrg_gate_slope_high,
+        mrg_gate_mode=args.mrg_gate_mode,
+        mrg_scalar_gate=args.mrg_scalar_gate,
+        mrg_ceiling_schedule=args.mrg_ceiling_schedule,
+        aux_loss_weight=args.aux_loss_weight,
+        skip_attn_layers=args.skip_attn_layers,
+        route_attn_layers=args.route_attn_layers,
+        route_into_mlp=args.route_into_mlp,
+        route_dim=args.route_dim,
+        route_shared=args.route_shared,
+        token_shift_frac=args.token_shift_frac,
+        token_shift_scales=args.token_shift_scales,
+        time_mix=args.time_mix,
+        init_mlp_up_gain=args.init_mlp_up_gain,
+        init_mlp_down_gain=args.init_mlp_down_gain,
+        init_o_proj_gain=args.init_o_proj_gain,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1988,6 +2360,13 @@ def main() -> None:
     if base_model.mlp_gate_bank is not None:
         base_model.mlp_gate_bank.data = base_model.mlp_gate_bank.data.float()
     base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
+    if base_model.route_up_bank is not None:
+        base_model.route_up_bank.data = base_model.route_up_bank.data.float()
+        base_model.route_down_bank.data = base_model.route_down_bank.data.float()
+    if base_model.route_shared_up is not None:
+        base_model.route_shared_up.data = base_model.route_shared_up.data.float()
+        base_model.route_shared_down.data = base_model.route_shared_down.data.float()
+        base_model.route_mix_bank.data = base_model.route_mix_bank.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -2009,6 +2388,13 @@ def main() -> None:
     ]
     if base_model.mlp_gate_bank is not None:
         matrix_params.append(base_model.mlp_gate_bank)
+    if base_model.route_up_bank is not None:
+        matrix_params.append(base_model.route_up_bank)
+        matrix_params.append(base_model.route_down_bank)
+    if base_model.route_shared_up is not None:
+        matrix_params.append(base_model.route_shared_up)
+        matrix_params.append(base_model.route_shared_down)
+        matrix_params.append(base_model.route_mix_bank)
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
         p
@@ -2078,6 +2464,10 @@ def main() -> None:
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
+    log0(f"aux_loss_weight:{args.aux_loss_weight}")
+    skip_set = sorted(base_model._skip_attn_set)
+    route_set = sorted(base_model._route_attn_set)
+    log0(f"skip_attn_layers:{skip_set} route_attn_layers:{route_set} route_into_mlp:{args.route_into_mlp} route_dim:{args.route_dim} route_shared:{args.route_shared} token_shift_frac:{args.token_shift_frac} token_shift_scales:{args.token_shift_scales} time_mix:{args.time_mix} init_mlp_up_gain:{args.init_mlp_up_gain} init_mlp_down_gain:{args.init_mlp_down_gain} init_o_proj_gain:{args.init_o_proj_gain}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -2177,9 +2567,27 @@ def main() -> None:
     attn_frozen = False
 
     def freeze_attention_banks() -> None:
-        base_model.qo_bank.requires_grad_(False)
+        route_set = base_model._route_attn_set
+        if route_set and base_model.route_up_bank is not None:
+            # Route layers have dedicated banks — qo_bank fully frozen
+            base_model.qo_bank.requires_grad_(False)
+            base_model.qo_bank.grad = None
+        elif route_set:
+            # Routing layers reuse Q/O banks — keep qo_bank trainable with gradient mask
+            n = base_model.num_layers
+            route_mask = torch.zeros(2 * n, 1, 1, device=base_model.qo_bank.device)
+            for layer_idx in route_set:
+                route_mask[layer_idx] = 1.0       # Q for routing layer
+                route_mask[n + layer_idx] = 1.0   # O for routing layer
+            base_model.qo_bank.register_hook(lambda grad: grad * route_mask)
+            # Zero out gradients for non-routing entries once
+            if base_model.qo_bank.grad is not None:
+                base_model.qo_bank.grad.mul_(route_mask)
+        else:
+            base_model.qo_bank.requires_grad_(False)
+            base_model.qo_bank.grad = None
+        # KV bank always fully frozen (routing doesn't use K/V)
         base_model.kv_bank.requires_grad_(False)
-        base_model.qo_bank.grad = None
         base_model.kv_bank.grad = None
         base_model.set_attention_frozen(True)
 
@@ -2556,6 +2964,27 @@ def main() -> None:
         gated_attention=args.gated_attention, value_residual=args.value_residual,
         mlp_act=args.mlp_act, mlp_competitive_frac=args.mlp_competitive_frac,
         serial_fusion=args.serial_fusion,
+        post_norm_affine=args.post_norm_affine,
+        mlp_resid_gate=args.mlp_resid_gate,
+        mlp_modulate_next=args.mlp_modulate_next,
+        geometric_routing_rank=args.geometric_routing_rank,
+        mrg_gate_slope=args.mrg_gate_slope,
+        mrg_gate_slope_high=args.mrg_gate_slope_high,
+        mrg_gate_mode=args.mrg_gate_mode,
+        mrg_scalar_gate=args.mrg_scalar_gate,
+        mrg_ceiling_schedule=args.mrg_ceiling_schedule,
+        aux_loss_weight=0.0,
+        skip_attn_layers=args.skip_attn_layers,
+        route_attn_layers=args.route_attn_layers,
+        route_into_mlp=args.route_into_mlp,
+        route_dim=args.route_dim,
+        route_shared=args.route_shared,
+        token_shift_frac=args.token_shift_frac,
+        token_shift_scales=args.token_shift_scales,
+        time_mix=args.time_mix,
+        init_mlp_up_gain=args.init_mlp_up_gain,
+        init_mlp_down_gain=args.init_mlp_down_gain,
+        init_o_proj_gain=args.init_o_proj_gain,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
@@ -2563,6 +2992,13 @@ def main() -> None:
     if eval_model.mlp_gate_bank is not None:
         eval_model.mlp_gate_bank.data = eval_model.mlp_gate_bank.data.float()
     eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+    if eval_model.route_up_bank is not None:
+        eval_model.route_up_bank.data = eval_model.route_up_bank.data.float()
+        eval_model.route_down_bank.data = eval_model.route_down_bank.data.float()
+    if eval_model.route_shared_up is not None:
+        eval_model.route_shared_up.data = eval_model.route_shared_up.data.float()
+        eval_model.route_shared_down.data = eval_model.route_shared_down.data.float()
+        eval_model.route_mix_bank.data = eval_model.route_mix_bank.data.float()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
             m.float()

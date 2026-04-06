@@ -1,11 +1,33 @@
-data/tokenizers
+# Python
 __pycache__/
+*.pyc
+.mypy_cache/
+.venv/
+
+# OS
 .DS_Store
-modded-nanogpt/
-modded-nanogpt
-data/datasets
+Thumbs.db
+
+# Data (downloaded at runtime)
+data/tokenizers/
+data/datasets/
 data/manifest.json
 data/docs_selected.jsonl
-.mypy_cache/
-.venv
+
+# Model checkpoints and compressed artifacts (binary, large)
+final_model*.pt
+final_model*.ptz
+*.ptz
+
+# Experiment logs (archived separately)
 logs/
+
+# Local dev/analysis tools (not needed for runs)
+analyze_weights.py
+diagnose_gradients.py
+ARCHITECTURE_AND_QUANT_THEORY.md
+train_gpt_mlx.py
+
+# Legacy / external
+modded-nanogpt/
+modded-nanogpt

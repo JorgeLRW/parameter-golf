@@ -18,6 +18,7 @@ import time
 import uuid
 import zlib
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import sentencepiece as spm
@@ -47,8 +48,10 @@ class Hyperparameters:
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_max_seqs = int(os.environ.get("VAL_MAX_SEQS", 0))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    attn_gauge_audit_batches = int(os.environ.get("ATTN_GAUGE_AUDIT_BATCHES", 0))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -58,6 +61,8 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    attn_sdp_backend = os.environ.get("ATTN_SDP_BACKEND", "flash").lower()
+    use_torch_compile = bool(int(os.environ.get("USE_TORCH_COMPILE", "1")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -204,13 +209,15 @@ def build_sentencepiece_luts(
     )
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
+def load_validation_tokens(pattern: str, seq_len: int, max_seqs: int = 0) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
-    usable = ((tokens.numel() - 1) // seq_len) * seq_len
+    total_seqs = (tokens.numel() - 1) // seq_len
+    usable_seqs = total_seqs if max_seqs <= 0 else min(total_seqs, max_seqs)
+    usable = usable_seqs * seq_len
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
@@ -276,6 +283,134 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def token_mean_gauge_fraction(t: Tensor) -> Tensor:
+    t32 = t.float()
+    if t32.numel() == 0 or t32.size(-2) == 0:
+        return torch.zeros((), device=t.device, dtype=torch.float32)
+    mean = t32.mean(dim=-2, keepdim=True)
+    gauge_energy = mean.square().sum() * t32.size(-2)
+    total_energy = t32.square().sum().clamp_min(1e-12)
+    return gauge_energy / total_energy
+
+
+def audit_attention_gauge(
+    args: Hyperparameters,
+    base_model: Any,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    stage: str,
+    log0,
+) -> None:
+    if args.attn_gauge_audit_batches <= 0:
+        return
+
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    if local_batch_tokens < args.train_seq_len:
+        raise ValueError(
+            "VAL_BATCH_SIZE must provide at least one sequence per rank for ATTN_GAUGE_AUDIT_BATCHES; "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    local_batch_seqs = local_batch_tokens // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+
+    layer_stats = [
+        {
+            "k_pre": torch.zeros((), device=device, dtype=torch.float32),
+            "k_post": torch.zeros((), device=device, dtype=torch.float32),
+            "v": torch.zeros((), device=device, dtype=torch.float32),
+            "count": torch.zeros((), device=device, dtype=torch.float32),
+        }
+        for _ in base_model.blocks
+    ]
+    handles = []
+
+    def make_pre_hook(layer_idx: int):
+        def pre_hook(module: Any, inputs: tuple[Tensor, ...]) -> None:
+            x = inputs[0]
+            bsz, seqlen, _ = x.shape
+            attn = module
+            k = attn.c_k(x).reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+            v = attn.c_v(x).reshape(bsz, seqlen, attn.num_kv_heads, attn.head_dim).transpose(1, 2)
+            k = F.rms_norm(k, (k.size(-1),))
+            cos, sin = attn.rotary(seqlen, x.device, k.dtype)
+            k_post = apply_rotary_emb(k, cos, sin)
+
+            layer_stats[layer_idx]["k_pre"] += token_mean_gauge_fraction(k)
+            layer_stats[layer_idx]["k_post"] += token_mean_gauge_fraction(k_post)
+            layer_stats[layer_idx]["v"] += token_mean_gauge_fraction(v)
+            layer_stats[layer_idx]["count"] += 1.0
+
+        return pre_hook
+
+    for layer_idx, block in enumerate(base_model.blocks):
+        handles.append(block.attn.register_forward_pre_hook(make_pre_hook(layer_idx)))
+
+    was_training = base_model.training
+    base_model.eval()
+    try:
+        with torch.inference_mode():
+            batches = 0
+            for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+                if batches >= args.attn_gauge_audit_batches:
+                    break
+                batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+                raw_start = batch_seq_start * args.train_seq_len
+                raw_end = batch_seq_end * args.train_seq_len + 1
+                local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                x = local[:-1].reshape(-1, args.train_seq_len)
+                y = local[1:].reshape(-1, args.train_seq_len)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    _ = base_model(x, y)
+                batches += 1
+    finally:
+        for handle in handles:
+            handle.remove()
+        if was_training:
+            base_model.train()
+
+    if dist.is_available() and dist.is_initialized():
+        for stat in layer_stats:
+            for value in stat.values():
+                dist.all_reduce(value, op=dist.ReduceOp.SUM)
+
+    if rank != 0:
+        return
+
+    log0(f"attention_gauge_audit stage:{stage} batches:{args.attn_gauge_audit_batches}")
+    mean_k_pre = 0.0
+    mean_k_post = 0.0
+    mean_v = 0.0
+    counted_layers = 0
+    for layer_idx, stat in enumerate(layer_stats):
+        count = float(stat["count"].item())
+        if count <= 0:
+            continue
+        k_pre = 100.0 * float((stat["k_pre"] / count).item())
+        k_post = 100.0 * float((stat["k_post"] / count).item())
+        v_gauge = 100.0 * float((stat["v"] / count).item())
+        mean_k_pre += k_pre
+        mean_k_post += k_post
+        mean_v += v_gauge
+        counted_layers += 1
+        log0(
+            f"attention_gauge layer:{layer_idx} stage:{stage} "
+            f"k_pre_pct:{k_pre:.2f} k_post_pct:{k_post:.2f} v_pct:{v_gauge:.2f}"
+        )
+    if counted_layers > 0:
+        log0(
+            f"attention_gauge_summary stage:{stage} "
+            f"k_pre_mean_pct:{mean_k_pre / counted_layers:.2f} "
+            f"k_post_mean_pct:{mean_k_post / counted_layers:.2f} "
+            f"v_mean_pct:{mean_v / counted_layers:.2f}"
+        )
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -733,7 +868,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.use_torch_compile:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -763,10 +899,21 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
+    sdp_backend_flags = {
+        "flash": {"flash": True, "mem_efficient": False, "math": False},
+        "math": {"flash": False, "mem_efficient": False, "math": True},
+        "mem_efficient": {"flash": False, "mem_efficient": True, "math": False},
+    }
+    if args.attn_sdp_backend not in sdp_backend_flags:
+        raise ValueError(
+            f"Unsupported ATTN_SDP_BACKEND={args.attn_sdp_backend!r}; "
+            f"expected one of {sorted(sdp_backend_flags)}"
+        )
+    selected_sdp = sdp_backend_flags[args.attn_sdp_backend]
     enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_flash_sdp(selected_sdp["flash"])
+    enable_mem_efficient_sdp(selected_sdp["mem_efficient"])
+    enable_math_sdp(selected_sdp["math"])
 
     logfile = None
     if master_process:
@@ -811,12 +958,13 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_seqs)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
+    log0(f"val_max_seqs:{args.val_max_seqs if args.val_max_seqs > 0 else 'full'}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
@@ -840,7 +988,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.use_torch_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -895,7 +1043,12 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"torch_compile:{args.use_torch_compile}")
+    log0(
+        "sdp_backends:"
+        f"cudnn=False flash={selected_sdp['flash']} "
+        f"mem_efficient={selected_sdp['mem_efficient']} math={selected_sdp['math']}"
+    )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -908,6 +1061,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"attn_gauge_audit_batches:{args.attn_gauge_audit_batches}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1059,6 +1213,18 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
+    audit_attention_gauge(
+        args,
+        base_model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        stage="pre_export",
+        log0=log0,
+    )
+
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
@@ -1117,6 +1283,18 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    audit_attention_gauge(
+        args,
+        base_model,
+        rank,
+        world_size,
+        device,
+        grad_accum_steps,
+        val_tokens,
+        stage="post_roundtrip",
+        log0=log0,
+    )
 
     if distributed:
         dist.destroy_process_group()
