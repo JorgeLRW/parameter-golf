@@ -38,7 +38,8 @@ export MAX_WALLCLOCK_SECONDS="600"
 export WARMUP_STEPS="0"
 export WARMDOWN_ITERS="4000"
 export USE_TORCH_COMPILE="1"
-export RUN_ID="h100_route110_shift50"
+export RUN_ID="${RUN_ID:-h100_route110_shift50}"
+export SEED="${SEED:-1337}"
 
 # ── GPTQ (AR self-gen calibration, matching #1 entry) ──
 export GPTQ_CALIB_SOURCE="ar"
@@ -53,6 +54,7 @@ echo "════════════════════════�
 echo "  Route110 + Shift50 — 8×H100 — 600s"
 echo "  BigramHash 3072×112, warmdown 4000"
 echo "  GPTQ: AR self-gen calib, LZMA preset=9"
+echo "  Run ID: ${RUN_ID}  Seed: ${SEED}"
 echo "═══════════════════════════════════════════════════"
 
 OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 train_gpt.py
