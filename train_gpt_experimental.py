@@ -2248,7 +2248,7 @@ def main() -> None:
             if dist.is_initialized():
                 dist.destroy_process_group()
             dist.init_process_group(backend="nccl")
-        dist.barrier()
+        dist.barrier(device_ids=[local_rank])
     master_process = rank == 0
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True

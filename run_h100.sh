@@ -30,6 +30,10 @@ export ATTN_FREEZE_STEP="5"
 export ATTN_DETACH_INPUT_AFTER_FREEZE="1"
 export ATTN_SDP_BACKEND="flash"
 
+# ── NCCL / RunPod compatibility ──
+export NCCL_CUMEM_ENABLE="0"
+export NCCL_NVLS_ENABLE="0"
+
 # ── Training ──
 # TRAIN_BATCH_TOKENS=786432 (default, correct for 8×H100)
 # TRAIN_SEQ_LEN=2048 (default)
