@@ -1,6 +1,7 @@
 from __future__ import annotations
 import copy
 import glob
+import inspect
 import io
 import lzma
 import math
@@ -30,6 +31,11 @@ try:
 except ImportError:
     flash_attn_3_func = None
     _HAS_FLASH_ATTN_3 = False
+
+try:
+    _SDPA_SUPPORTS_ENABLE_GQA = "enable_gqa" in inspect.signature(F.scaled_dot_product_attention).parameters
+except (TypeError, ValueError):
+    _SDPA_SUPPORTS_ENABLE_GQA = False
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -162,13 +168,33 @@ def _resolve_gptq_block_size(
 def flash_attention_or_sdpa(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
     if _HAS_FLASH_ATTN_3:
         return flash_attn_3_func(q, k, v, causal=True)
-    y = F.scaled_dot_product_attention(
-        q.transpose(1, 2),
-        k.transpose(1, 2),
-        v.transpose(1, 2),
-        is_causal=True,
-        enable_gqa=True,
-    )
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+    use_gqa = q_t.size(1) != k_t.size(1)
+    if _SDPA_SUPPORTS_ENABLE_GQA:
+        y = F.scaled_dot_product_attention(
+            q_t,
+            k_t,
+            v_t,
+            is_causal=True,
+            enable_gqa=use_gqa,
+        )
+    else:
+        if use_gqa:
+            if q_t.size(1) % k_t.size(1) != 0:
+                raise ValueError(
+                    f"num_heads={q_t.size(1)} must be divisible by num_kv_heads={k_t.size(1)}"
+                )
+            repeat = q_t.size(1) // k_t.size(1)
+            k_t = k_t.repeat_interleave(repeat, dim=1)
+            v_t = v_t.repeat_interleave(repeat, dim=1)
+        y = F.scaled_dot_product_attention(
+            q_t,
+            k_t,
+            v_t,
+            is_causal=True,
+        )
     return y.transpose(1, 2)
 
 # --- Batched Newton-Schulz orthogonalization ---
