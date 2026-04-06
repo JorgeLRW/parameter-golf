@@ -41,7 +41,7 @@ export ITERATIONS="20000"
 # Small safety buffer below the hard 600s challenge cap.
 export MAX_WALLCLOCK_SECONDS="599.5"
 export WARMUP_STEPS="0"
-export WARMDOWN_ITERS="4000"
+export WARMDOWN_ITERS="1200"
 export USE_TORCH_COMPILE="${USE_TORCH_COMPILE:-1}"
 export RUN_ID="${RUN_ID:-h100_route110_shift50}"
 export SEED="${SEED:-1337}"
