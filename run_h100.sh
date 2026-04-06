@@ -40,6 +40,7 @@ export WARMDOWN_ITERS="4000"
 export USE_TORCH_COMPILE="1"
 export RUN_ID="${RUN_ID:-h100_route110_shift50}"
 export SEED="${SEED:-1337}"
+export TARGET_BYTES="15900000"
 
 # ── GPTQ (AR self-gen calibration, matching #1 entry) ──
 export GPTQ_CALIB_SOURCE="ar"
